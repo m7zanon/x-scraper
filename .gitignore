@@ -1,0 +1,12 @@
+# dependências
+node_modules/
+
+# variáveis de ambiente
+.env
+
+# arquivos temporários ou de cache
+storage/
+*.log
+
+# sistema
+.DS_Store
