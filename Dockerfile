@@ -3,7 +3,10 @@ FROM mcr.microsoft.com/playwright:v1.45.0-jammy
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --omit=dev
+
+# Instalar dependências e browsers do Playwright
+RUN npm install && npx playwright install --with-deps
+
 COPY . .
 
 # Pasta persistente p/ datasets do Crawlee
