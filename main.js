@@ -1,76 +1,98 @@
-import { PlaywrightCrawler, Dataset, log, sleep } from 'crawlee';
-import { chromium } from 'playwright';
+// main.js
+const { PlaywrightCrawler, ProxyConfiguration, log } = require('crawlee');
 
-const MAX_SCROLLS = Number(process.env.MAX_SCROLLS || 10);
-const SCROLL_DELAY_MS = Number(process.env.SCROLL_DELAY_MS || 1200);
-const HEADLESS = process.env.HEADLESS !== 'false';
-
-function buildCookiesForX() {
-  const cookies = [];
-  if (process.env.X_AUTH_TOKEN) cookies.push({ name: 'auth_token', value: process.env.X_AUTH_TOKEN, domain: '.x.com', path: '/' });
-  if (process.env.X_CT0) cookies.push({ name: 'ct0', value: process.env.X_CT0, domain: '.x.com', path: '/' });
-  return cookies;
+function parseBool(v, def = true) {
+  if (v === undefined) return def;
+  return String(v).toLowerCase() !== 'false' && v !== '0';
 }
 
-const extractTweets = async (page) => {
-  await page.waitForSelector('[data-testid="tweet"], article[role="article"]', { timeout: 20000 });
-  const items = await page.$$eval('article[role="article"]', (articles) => {
-    const out = [];
-    for (const el of articles) {
-      try {
-        const time = el.querySelector('time');
-        const datetime = time?.getAttribute('datetime') ?? null;
+async function setAuthCookies(page) {
+  const auth = process.env.X_AUTH_TOKEN;
+  const ct0 = process.env.X_CT0;
 
-        const textNodes = Array.from(el.querySelectorAll('[data-testid="tweetText"]'));
-        const text = textNodes.map(n => n.innerText.trim()).join('\n').trim();
+  if (!auth || !ct0) return;
 
-        const a = Array.from(el.querySelectorAll('a')).find(l => /\/status\/\d+/.test(l.getAttribute('href') || ''));
-        let url = a ? a.href : null;
-        let id = url?.match(/status\/(\d+)/)?.[1] || null;
+  const cookies = [
+    { name: 'auth_token', value: auth, domain: '.x.com', path: '/', httpOnly: true, secure: true },
+    { name: 'ct0', value: ct0, domain: '.x.com', path: '/', httpOnly: true, secure: true },
+    // Mantém compatibilidade com twitter.com se necessário:
+    { name: 'auth_token', value: auth, domain: '.twitter.com', path: '/', httpOnly: true, secure: true },
+    { name: 'ct0', value: ct0, domain: '.twitter.com', path: '/', httpOnly: true, secure: true },
+  ];
+  await page.context().addCookies(cookies);
+}
 
-        const userA = Array.from(el.querySelectorAll('a')).find(l => /^https?:\/\/(x|twitter)\.com\/[^\/]+$/.test(l.href));
-        const username = userA ? userA.href.split('/').pop() : null;
+async function autoScroll(page, { maxScrolls = 10, delayMs = 1200 }) {
+  for (let i = 0; i < maxScrolls; i++) {
+    await page.mouse.wheel(0, 2000);
+    await page.waitForTimeout(delayMs);
+  }
+}
 
-        const aria = sel => el.querySelector(sel)?.getAttribute('aria-label') || '';
-        const metrics = { _raw: [aria('[data-testid="reply"]'), aria('[data-testid="retweet"]'), aria('[data-testid="like"]')].join('|') };
+function extractTweetsFromDom() {
+  // roda no browser: pega artigos (tweets) visíveis
+  const articles = Array.from(document.querySelectorAll('article[role="article"]'));
+  return articles.map(a => {
+    const linkEl = a.querySelector('a[href*="/status/"][role="link"]');
+    const url = linkEl ? linkEl.href : null;
+    const id = url ? (url.split('/status/')[1] || '').split('?')[0] : null;
+    const text = a.innerText || '';
+    const userEl = a.querySelector('a[href^="https://x.com/"] span');
+    const username = userEl ? userEl.textContent : null;
+    return { id, url, text, username };
+  }).filter(t => t.id && t.url);
+}
 
-        if (id && url) out.push({ id, url, text, username, createdAt: datetime, metrics, isRetweet: !!el.querySelector('[data-testid="socialContext"]'), scrapedAt: new Date().toISOString() });
-      } catch {}
-    }
-    return out.filter(t => t.id && t.url);
-  });
-  return Array.from(new Map(items.map(t => [t.id, t])).values());
-};
+/**
+ * Roda o crawler no targetUrl e retorna um array de tweets.
+ * @param {string} targetUrl
+ * @param {{maxScrolls?: number, delayMs?: number}} opts
+ * @returns {Promise<Array>}
+ */
+async function runScraper(targetUrl, opts = {}) {
+  if (!targetUrl) throw new Error('Missing targetUrl');
 
-export async function scrapeOnce(startUrl) {
+  const items = [];
+  const headless = parseBool(process.env.HEADLESS, true);
+
   const crawler = new PlaywrightCrawler({
     launchContext: {
-      launcher: chromium,
-      launchOptions: { headless: HEADLESS, args: process.env.HTTP_PROXY ? [`--proxy-server=${process.env.HTTP_PROXY}`] : [] }
+      launchOptions: {
+        headless,
+        // aumenta estabilidade em VPS com pouco /dev/shm
+        args: ['--disable-dev-shm-usage'],
+      },
     },
-    requestHandlerTimeoutSecs: 120,
-    maxRequestsPerCrawl: 1,
-    preNavigationHooks: [async ({ page }) => {
-      const cookies = buildCookiesForX();
-      if (cookies.length) await page.context().addCookies(cookies);
-    }],
-    requestHandler: async ({ page, log }) => {
-      log.info(`Abrindo: ${startUrl}`);
-      await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    // Proxy opcional via env HTTP_PROXY
+    proxyConfiguration: process.env.HTTP_PROXY
+      ? new ProxyConfiguration({ proxyUrls: [process.env.HTTP_PROXY] })
+      : undefined,
 
-      let all = [];
-      for (let i = 0; i < MAX_SCROLLS; i++) {
-        const chunk = await extractTweets(page);
-        all = [...all, ...chunk];
-        await Dataset.pushData(chunk);
-        await page.mouse.wheel(0, 2000);
-        await sleep(SCROLL_DELAY_MS);
-      }
-      return Array.from(new Map(all.map(t => [t.id, t])).values());
+    // HANDLER VAI NO CONSTRUTOR (Crawlee 3.x):
+    requestHandler: async ({ page, request }) => {
+      log.info(`▶️ Abrindo: ${request.url}`);
+
+      // garante cookies antes de navegar
+      await setAuthCookies(page);
+
+      await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 90_000 });
+
+      // rolar feed para carregar mais tweets
+      await autoScroll(page, opts);
+
+      // extrair no DOM
+      const pageItems = await page.evaluate(extractTweetsFromDom);
+      items.push(...pageItems);
+      log.info(`✅ Coletados ${pageItems.length} itens nesta página`);
     },
   });
 
-  let result = [];
-  await crawler.run([startUrl], { requestHandler: async (ctx, next) => { result = await ctx.requestHandler(ctx); await next(); } });
-  return result;
+  await crawler.run([targetUrl]);
+
+  // de-duplicar por id
+  const uniq = new Map();
+  for (const t of items) uniq.set(t.id, t);
+  return Array.from(uniq.values());
 }
+
+module.exports = { runScraper };
